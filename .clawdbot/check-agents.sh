@@ -1,117 +1,124 @@
 #!/usr/bin/env bash
-# Monitoring loop — runs every 10 min via cron.
-# Checks tmux sessions, PR status, CI status.
-# Notifies via OpenClaw/Telegram when PRs are ready or agents need attention.
+# check-agents.sh — monitoring loop, runs every 10 min via launchd
+#
+# Checks: tmux alive, PR created, CI status
+# Actions: respawn failed agents (max 3x), notify Telegram on PR ready or failure
 
 set -euo pipefail
-
 export PATH="/opt/homebrew/opt/node@22/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 TASKS_FILE="$REPO_ROOT/.clawdbot/active-tasks.json"
 MAX_RETRIES=3
 
+# Telegram — sends to Hex channel (topic 2182)
+TELEGRAM_BOT_TOKEN="REDACTED_TOKEN"
+TELEGRAM_CHAT_ID="-1003532725632"
+TELEGRAM_TOPIC_ID="2182"
+
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"; }
 
 notify() {
   local msg="$1"
-  # Send via OpenClaw CLI to Hex's Telegram channel (topic 2182)
-  openclaw message send \
-    --channel telegram \
-    --account hex \
-    --group -1003532725632 \
-    --topic 2182 \
-    --text "$msg" 2>/dev/null || log "Notify failed: $msg"
+  curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+    -d "chat_id=${TELEGRAM_CHAT_ID}" \
+    -d "message_thread_id=${TELEGRAM_TOPIC_ID}" \
+    -d "text=${msg}" \
+    -d "parse_mode=HTML" > /dev/null 2>&1 || log "Telegram notify failed"
 }
 
 cd "$REPO_ROOT"
 
 # Load tasks
-TASKS=$(cat "$TASKS_FILE")
-TASK_COUNT=$(echo "$TASKS" | node -e "process.stdin.resume();let d='';process.stdin.on('data',c=>d+=c);process.stdin.on('end',()=>console.log(JSON.parse(d).length))")
-
+TASK_COUNT=$(python3 -c "import json; t=json.load(open('$TASKS_FILE')); print(len([x for x in t if x['status'] in ('running','queued')]))")
 if [ "$TASK_COUNT" -eq 0 ]; then
   log "No active tasks."
   exit 0
 fi
+log "Checking $TASK_COUNT active task(s)..."
 
-# Process each running task
-echo "$TASKS" | node -e "
-const fs = require('fs');
-const tasks = JSON.parse(require('fs').readFileSync('$TASKS_FILE'));
+# Process each task
+python3 - <<PYEOF
+import json, subprocess, os, time
 
-tasks.forEach((task, idx) => {
-  if (task.status !== 'running') return;
+TASKS_FILE = '$TASKS_FILE'
+REPO_ROOT = '$REPO_ROOT'
+MAX_RETRIES = $MAX_RETRIES
+tasks = json.load(open(TASKS_FILE))
+events = []
 
-  const checks = {
-    tmuxAlive: false,
-    prCreated: false,
-    ciPassed: false,
-    prNumber: null,
-  };
+def run(cmd, **kw):
+    return subprocess.run(cmd, capture_output=True, text=True, **kw)
 
-  // Check tmux session
-  const { execSync } = require('child_process');
-  try {
-    execSync('tmux has-session -t ' + task.tmuxSession, { stdio: 'ignore' });
-    checks.tmuxAlive = true;
-  } catch {}
+for idx, task in enumerate(tasks):
+    if task['status'] not in ('running', 'queued'):
+        continue
 
-  // Check for open PR on branch
-  try {
-    const pr = execSync('gh pr view ' + task.branch + ' --json number,state,statusCheckRollup 2>/dev/null', { cwd: '$REPO_ROOT' }).toString();
-    const prData = JSON.parse(pr);
-    checks.prCreated = true;
-    checks.prNumber = prData.number;
+    task_id = task['id']
+    session = task.get('tmuxSession', f'agent-{task_id}')
+    branch = task.get('branch', '')
 
-    // Check CI
-    if (prData.statusCheckRollup) {
-      const allPassed = prData.statusCheckRollup.every(c => c.conclusion === 'SUCCESS' || c.status === 'COMPLETED');
-      checks.ciPassed = allPassed;
-    }
-  } catch {}
+    # Check tmux
+    tmux_alive = run(['tmux', 'has-session', '-t', session]).returncode == 0
 
-  // Write back updated checks
-  tasks[idx].checks = { ...tasks[idx].checks, ...checks };
-  if (checks.prCreated) tasks[idx].pr = checks.prNumber;
+    # Check for PR
+    pr_number = None
+    ci_passed = False
+    try:
+        pr = run(['gh', 'pr', 'view', branch, '--json', 'number,state,statusCheckRollup'],
+                 cwd=REPO_ROOT)
+        if pr.returncode == 0:
+            pr_data = json.loads(pr.stdout)
+            pr_number = pr_data.get('number')
+            checks = pr_data.get('statusCheckRollup') or []
+            ci_passed = bool(checks) and all(
+                c.get('conclusion') == 'SUCCESS' or c.get('status') == 'COMPLETED'
+                for c in checks
+            )
+    except:
+        pass
 
-  // If PR exists and CI passed — mark done
-  if (checks.prCreated && checks.ciPassed) {
-    tasks[idx].status = 'done';
-    tasks[idx].completedAt = Date.now();
-    tasks[idx].note = 'CI passed. Ready to merge.';
-    console.log('READY:' + task.id + ':' + checks.prNumber);
-  }
+    # Update task
+    if pr_number:
+        tasks[idx]['pr'] = pr_number
+    tasks[idx]['lastChecked'] = int(time.time() * 1000)
 
-  // If tmux died and no PR — flag for respawn
-  if (!checks.tmuxAlive && !checks.prCreated) {
-    const retries = task.retries || 0;
-    if (retries < $MAX_RETRIES) {
-      tasks[idx].retries = retries + 1;
-      tasks[idx].status = 'respawn';
-      console.log('RESPAWN:' + task.id);
-    } else {
-      tasks[idx].status = 'failed';
-      console.log('FAILED:' + task.id);
-    }
-  }
-});
+    # PR ready
+    if pr_number and ci_passed and task['status'] == 'running':
+        tasks[idx]['status'] = 'done'
+        tasks[idx]['completedAt'] = int(time.time() * 1000)
+        tasks[idx]['note'] = 'CI passed. Ready to merge.'
+        events.append(('READY', task_id, str(pr_number), task.get('description','')))
 
-fs.writeFileSync('$TASKS_FILE', JSON.stringify(tasks, null, 2));
-" | while IFS=: read -r event task_id pr_or_empty; do
+    # Agent died without PR
+    elif not tmux_alive and not pr_number and task['status'] == 'running':
+        retries = task.get('retries', 0)
+        if retries < MAX_RETRIES:
+            tasks[idx]['retries'] = retries + 1
+            tasks[idx]['status'] = 'running'  # will be relaunched
+            events.append(('RESPAWN', task_id, '', task.get('description','')))
+        else:
+            tasks[idx]['status'] = 'failed'
+            events.append(('FAILED', task_id, '', task.get('description','')))
+
+json.dump(tasks, open(TASKS_FILE, 'w'), indent=2)
+
+for event, task_id, extra, desc in events:
+    print(f'{event}:{task_id}:{extra}:{desc}')
+PYEOF | while IFS=: read -r event task_id extra desc; do
   case "$event" in
     READY)
-      log "PR ready: $task_id (PR #$pr_or_empty)"
-      notify "✅ PR #$pr_or_empty ready for review — $task_id. CI passed. Go merge it."
+      log "✅ PR #$extra ready: $task_id ($desc)"
+      notify "✅ <b>PR #${extra} ready for review</b>%0A${desc}%0ACI passed. Go merge it."
       ;;
     RESPAWN)
-      log "Respawning agent: $task_id"
+      log "🔄 Respawning: $task_id"
       "$REPO_ROOT/.clawdbot/run-agent.sh" "$task_id" &
-      notify "🔄 Agent respawned: $task_id"
+      notify "🔄 Agent respawned: ${task_id}"
       ;;
     FAILED)
-      log "Agent failed after max retries: $task_id"
-      notify "❌ Agent failed (max retries): $task_id — needs your attention."
+      log "❌ Agent failed (max retries): $task_id"
+      notify "❌ <b>Agent failed</b>: ${task_id} — max retries hit. Needs attention."
       ;;
   esac
 done
