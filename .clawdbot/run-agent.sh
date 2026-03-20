@@ -62,20 +62,25 @@ tasks[idx].update({'status': 'running', 'tmuxSession': '$SESSION_NAME', 'started
 json.dump(tasks, open('$TASKS_FILE','w'), indent=2)
 PYEOF
 
-# Build agent command
+# Build agent command — interactive mode in tmux for mid-task steering
+PROMPT_CONTENT=$(cat "$PROMPT_FILE")
+
 if echo "$MODEL" | grep -qi "claude\|anthropic\|opus\|sonnet\|haiku"; then
-  # Claude Code
-  CMD="claude --dangerously-skip-permissions -p \"$(cat $PROMPT_FILE)\""
+  # Claude Code — interactive mode, skip permissions
+  CMD="claude --model $MODEL --dangerously-skip-permissions -p $(printf '%q' "$PROMPT_CONTENT")"
   log "Launching Claude Code (model: $MODEL)"
 else
-  # Codex
-  CMD="codex exec -c model=$MODEL \"$(cat $PROMPT_FILE)\""
+  # Codex — interactive mode, bypass approvals
+  CMD="codex --model $MODEL -c 'model_reasoning_effort=$EFFORT' --dangerously-bypass-approvals-and-sandbox $(printf '%q' "$PROMPT_CONTENT")"
   log "Launching Codex (model: $MODEL, effort: $EFFORT)"
 fi
 
-# Launch in tmux
+# Launch in tmux — interactive so we can steer mid-task with tmux send-keys
 tmux new-session -d -s "$SESSION_NAME" -c "$WORKTREE_PATH" \
-  "export PATH=/opt/homebrew/opt/node@22/bin:/opt/homebrew/bin:/usr/local/bin:\$PATH; $CMD; echo '[agent-done]'"
+  "export PATH=/opt/homebrew/opt/node@22/bin:/opt/homebrew/bin:/usr/local/bin:\$PATH; $CMD; echo '[agent-done]'; read"
+
+log "To steer: tmux send-keys -t $SESSION_NAME 'your message here' Enter"
+log "To watch: tmux attach -t $SESSION_NAME"
 
 log "Agent launched: session=$SESSION_NAME worktree=$WORKTREE_PATH"
 rm -f "$PROMPT_FILE"
