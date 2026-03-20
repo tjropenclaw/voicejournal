@@ -11,8 +11,19 @@ REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 TASKS_FILE="$REPO_ROOT/.clawdbot/active-tasks.json"
 MAX_RETRIES=3
 
-# Telegram — sends to Hex channel (topic 2182)
-TELEGRAM_BOT_TOKEN="REDACTED_TOKEN"
+# Telegram — load from keychain or .env
+ENV_FILE="$(dirname "$0")/../.env"
+[ -f "$ENV_FILE" ] && source "$ENV_FILE"
+
+if [ -z "${TELEGRAM_BOT_TOKEN:-}" ]; then
+  TELEGRAM_BOT_TOKEN=$(security find-generic-password -s "hex-telegram-bot-token" -w 2>/dev/null || echo "")
+fi
+
+if [ -z "${TELEGRAM_BOT_TOKEN:-}" ]; then
+  echo "ERROR: TELEGRAM_BOT_TOKEN not set. Add to keychain or .env" >&2
+  exit 1
+fi
+
 TELEGRAM_CHAT_ID="-1003532725632"
 TELEGRAM_TOPIC_ID="2182"
 
